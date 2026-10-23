@@ -1,0 +1,17 @@
+# Scenario: a non-@ group message outside the active window is dropped.
+#
+# No window is open yet (fresh adapter, no prior @/outbound activity), so the
+# adapter must not forward the event and the plugin must not send anything.
+#
+#   python tools/mock_onebot.py --adapter-url ws://127.0.0.1:18800/onebot \
+#       --token <onebot_ws_token> --scenario scenarios/non_at_outside_window.yaml
+name: non-at-outside-window
+steps:
+  - send_event:
+      type: group_message
+      group_id: 42
+      user_id: 100
+      text: "随便聊聊，没有 @ 你"
+  - sleep: 0.8
+  - expect:
+      no_sends: true

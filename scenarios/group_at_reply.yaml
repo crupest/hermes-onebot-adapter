@@ -1,0 +1,24 @@
+# Scenario: @bot in a group should produce a forwarded event and a reply.
+#
+# Run against a live adapter with a connected Hermes plugin that answers:
+#   python tools/mock_onebot.py --adapter-url ws://127.0.0.1:18800/onebot \
+#       --token <onebot_ws_token> --scenario scenarios/group_at_reply.yaml
+#
+# Adjust group_id/user_id to a real test group/account.
+name: group-at-reply
+steps:
+  - send_event:
+      type: group_message
+      group_id: 42
+      user_id: 100
+      text: "你好，在吗"
+      at: true
+  - sleep: 1.0
+  # Name resolution calls get_group_info/get_group_member_info over the same WS.
+  - expect_api:
+      - action: get_group_info
+  # The plugin reply is forwarded as send_group_msg on the same socket.
+  - expect:
+      sends:
+        - action: send_group_msg
+          group_id: 42

@@ -11,6 +11,10 @@ NapCat ──双向 OneBot 11 WS（事件 + API）── 适配器服务 ──W
 
 适配器服务承担全部 OneBot 交互；事件接收和 API 调用共用同一条 OneBot WebSocket，不需要独立的 OneBot HTTP API 端口。插件只与适配器服务通信，不直接接触 OneBot，也不修改 Hermes 本身的代码。
 
+> `crupest` fork 增加了群活跃窗口、通知上下文、选择性表情、adapter API allowlist、
+> Hermes 工具 allowlist、self-profile 工具和 Hermes 0.19 兼容；完整列表见
+> [CHANGELOG.md](CHANGELOG.md)。
+
 更细的 REST API 字段、专项诊断和维护者架构说明见 [文档索引](docs/README.md)。
 
 - [快速开始](#快速开始)

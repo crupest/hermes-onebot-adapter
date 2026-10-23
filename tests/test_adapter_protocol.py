@@ -247,3 +247,180 @@ async def test_request_ws_closed():
     adapter._ws = None
     result = await adapter._request("send_text", chat_id="100", content="hi")
     assert result["success"] is False
+
+
+# ── Hermes 0.19 compatibility ─────────────────────────────────────────────
+
+
+def test_connection_state_drives_base_is_connected():
+    """0.19 ``is_connected`` reads ``_running``; markers must update it."""
+    adapter = _make_adapter()
+    adapter._fatal_error_message = "previous failure"
+    adapter._fatal_error_code = "connect_failed"
+    adapter._fatal_error_retryable = True
+    adapter._write_runtime_status_safe = MagicMock()
+
+    adapter._set_connection_state(True)
+    assert adapter._is_connected is True
+    assert adapter._running is True
+    assert adapter.is_connected is True
+    # 0.19 _mark_connected() clears a fatal error so reconnects recover.
+    assert adapter._fatal_error_message is None
+    assert adapter._fatal_error_code is None
+
+    adapter._set_connection_state(False)
+    assert adapter._is_connected is False
+    assert adapter._running is False
+    assert adapter.is_connected is False
+
+
+async def test_connect_and_disconnect_toggle_base_is_connected(monkeypatch):
+    """connect()/disconnect() must drive 0.19's ``is_connected`` property."""
+    import onebot_adapter.hermes_plugin.adapter as plugin_mod
+
+    adapter = _make_adapter()
+    adapter._stop_event = asyncio.Event()
+    adapter._watchdog_task = None
+    adapter._recv_task = None
+    adapter._event_tasks = set()
+    adapter._write_runtime_status_safe = MagicMock()
+    adapter._ws_connect = AsyncMock()
+    adapter._receive_loop = AsyncMock()
+    adapter._watchdog = AsyncMock()
+
+    class _FakeSession:
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(plugin_mod.aiohttp, "ClientSession", lambda: _FakeSession())
+
+    assert await adapter.connect() is True
+    assert adapter.is_connected is True
+    await adapter.disconnect()
+    assert adapter.is_connected is False
+
+
+async def test_send_image_file_sends_native_image_frame():
+    """0.19 routes local images through send_image_file; it must not fall back to text."""
+    adapter = _make_adapter()
+    fake_ws = FakeWS()
+    fake_ws._adapter = adapter
+    adapter._ws = fake_ws
+    result = await adapter.send_image_file(
+        "group:42", "/tmp/img file.jpg", caption="**cap**", reply_to="7",
+    )
+    assert result.success is True
+    sent = fake_ws.sent[0]
+    assert sent["type"] == "send"
+    assert sent["action"] == "send_image"
+    assert sent["chat_id"] == "group:42"
+    assert sent["image_url"] == "/tmp/img file.jpg"
+    assert sent["caption"] == "cap"
+    assert sent["reply_to"] == "7"
+
+
+async def test_send_image_file_preserves_non_retryable_failure():
+    adapter = _make_adapter()
+    fake_ws = FakeWS()
+    fake_ws._adapter = adapter
+
+    async def _fail(msg):
+        fake_ws.sent.append(msg)
+        fut = adapter._futures.pop(msg["req_id"])
+        fut.set_result({"success": False, "error": "blocked", "retryable": False})
+
+    fake_ws.send_json = _fail
+    adapter._ws = fake_ws
+    result = await adapter.send_image_file("group:42", "/tmp/x.jpg")
+    assert result.success is False
+    assert result.retryable is False
+    assert result.error == "blocked"
+
+
+async def test_send_multiple_images_routes_file_uri_to_native_send():
+    """0.19's send_multiple_images(file://…) must reach our native image sender."""
+    adapter = _make_adapter()
+    fake_ws = FakeWS()
+    fake_ws._adapter = adapter
+    adapter._ws = fake_ws
+    await adapter.send_multiple_images("group:42", [("file:///tmp/a%20b.jpg", "")])
+    sent = fake_ws.sent[0]
+    assert sent["action"] == "send_image"
+    assert sent["image_url"] == "/tmp/a b.jpg"
+
+
+async def test_message_event_uses_source_for_identity(monkeypatch):
+    """0.19 MessageEvent has no top-level chat_id/user_id; identity is on source."""
+    import onebot_adapter.hermes_plugin.adapter as plugin_mod
+
+    adapter = _make_adapter()
+    adapter._media_delivery_mode = "passthrough"
+    adapter._completed_deliveries = {}
+    adapter._event_tasks = set()
+    seen = []
+    captured = {}
+
+    real_message_event = plugin_mod.MessageEvent
+
+    def _recording_message_event(**kwargs):
+        captured.update(kwargs)
+        return real_message_event(**kwargs)
+
+    monkeypatch.setattr(plugin_mod, "MessageEvent", _recording_message_event)
+
+    async def _capture(event, msg_ctx, delivery_ids=None):
+        seen.append(event)
+
+    adapter._dispatch_event = _capture
+    await adapter._handle_event({
+        "event": "message",
+        "chat_id": "group:42",
+        "chat_type": "group",
+        "chat_name": "Test Group",
+        "user_id": "123",
+        "user_name": "Alice",
+        "text": "hello",
+        "message_id": "77",
+        "timestamp": 1700000000,
+        "delivery_ids": ["d1"],
+    })
+    await asyncio.sleep(0)
+
+    assert "source" in captured
+    for unsupported in ("chat_id", "user_id", "user_name", "is_group", "platform"):
+        assert unsupported not in captured
+
+    assert len(seen) == 1
+    event = seen[0]
+    assert event.source.chat_id == "group:42"
+    assert event.source.chat_type == "group"
+    assert event.source.user_id == "123"
+    assert event.source.user_name == "Alice"
+
+
+async def test_send_returns_sendresult_and_respects_retryable():
+    adapter = _make_adapter()
+    fake_ws = FakeWS()
+    fake_ws._adapter = adapter
+    adapter._ws = fake_ws
+    result = await adapter.send("100", "hello")
+    assert isinstance(result, SendResult)
+    assert result.success is True
+    assert fake_ws.sent[0]["action"] == "send_text"
+
+    failing = FakeWS()
+    failing._adapter = adapter
+    adapter._ws = failing
+
+    async def _fail(msg):
+        failing.sent.append(msg)
+        fut = adapter._futures.pop(msg["req_id"])
+        fut.set_result({"success": False, "error": "nope", "retryable": False})
+
+    failing.send_json = _fail
+    result = await adapter.send("100", "hello")
+    assert result.success is False
+    assert result.retryable is False
+    assert result.error == "nope"

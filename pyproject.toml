@@ -57,6 +57,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "no_fake_home: do not monkeypatch Path.home to tmp_path in installer tests",
+    "integration: end-to-end adapter, MockOneBot and gateway tests",
 ]
 
 [tool.ruff]

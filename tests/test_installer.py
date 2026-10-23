@@ -1,4 +1,7 @@
 """Tests for the plugin installer (install + uninstall + .env auto-write)."""
+import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -306,3 +309,29 @@ def test_validate_extra_and_upload_roots():
     assert installer.validate_upload_root("/etc/passwd") is not None
     assert installer.validate_upload_root("/tmp/hermes-onebot-adapter-uploads") is None
     assert installer.validate_upload_root("relative") is not None
+
+
+def test_install_env_file_is_owner_only(tmp_path):
+    installer.install(
+        str(tmp_path / "hermes"),
+        adapter_url="ws://127.0.0.1:18810/hermes",
+        adapter_token="sectok123",
+    )
+    mode = stat.S_IMODE((tmp_path / "hermes" / ".env").stat().st_mode)
+    if os.name == "nt":
+        # Windows does not expose POSIX mode bits; the atomic replace still
+        # keeps the file inside the user's profile ACL.
+        assert mode
+    else:
+        assert mode == 0o600
+
+
+def test_init_config_from_empty_dir(tmp_path, monkeypatch):
+    from onebot_adapter.__main__ import main
+
+    target = tmp_path / "config.json"
+    monkeypatch.setenv("ONEBOT_ADAPTER_CONFIG", str(target))
+    assert main(["--init-config"]) == 0
+    cfg = json.loads(target.read_text(encoding="utf-8"))
+    for key in ("onebot_ws_token", "hermes_ws_token", "webui_token"):
+        assert cfg[key], f"{key} should be generated on first init"

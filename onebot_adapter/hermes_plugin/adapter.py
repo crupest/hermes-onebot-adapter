@@ -469,6 +469,24 @@ class OneBotAdapter(BasePlatformAdapter):  # type: ignore[misc]
     def name(self) -> str:
         return "OneBot"
 
+    def _set_connection_state(self, connected: bool) -> None:
+        """Publish the live WS state through the Hermes base-class contract.
+
+        Hermes 0.19 exposes ``is_connected`` as ``self._running`` and only
+        updates that flag through ``_mark_connected()`` /
+        ``_mark_disconnected()`` (``gateway/platforms/base.py:2789-2800`` and
+        ``2883-2886``).  Writing ``self._is_connected`` alone leaves the base
+        class permanently disconnected, so runtime status never reports
+        ``connected``.  Older hosts and test doubles may not expose the marker
+        helpers; fall back to setting ``_running`` directly.
+        """
+        self._is_connected = connected
+        marker = getattr(self, "_mark_connected" if connected else "_mark_disconnected", None)
+        if callable(marker):
+            marker()
+        else:
+            self._running = connected
+
     # ── Connection lifecycle ─────────────────────────────────────────────
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -503,7 +521,7 @@ class OneBotAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self._stop_event.clear()
         self._recv_task = asyncio.create_task(self._receive_loop())
         self._watchdog_task = asyncio.create_task(self._watchdog())
-        self._is_connected = True
+        self._set_connection_state(True)
         logger.info("OneBot: connected to adapter service at %s", self._adapter_url)
         # Push the current slash-command registry to the adapter service so it
         # can filter /commands before forwarding messages.  Sent after the
@@ -540,7 +558,7 @@ class OneBotAdapter(BasePlatformAdapter):  # type: ignore[misc]
         task.add_done_callback(self._push_tasks.discard)
 
     async def disconnect(self) -> None:
-        self._is_connected = False
+        self._set_connection_state(False)
         self._stop_event.set()
         if self._watchdog_task:
             self._watchdog_task.cancel()
@@ -607,7 +625,7 @@ class OneBotAdapter(BasePlatformAdapter):  # type: ignore[misc]
             if self._stop_event.is_set():
                 break
 
-            self._is_connected = False
+            self._set_connection_state(False)
             logger.warning("OneBot: connection lost, reconnecting in %.1fs", delay)
 
             # Interruptible backoff sleep.
@@ -649,7 +667,7 @@ class OneBotAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
                 await self._ws_connect()
                 self._recv_task = asyncio.create_task(self._receive_loop())
-                self._is_connected = True
+                self._set_connection_state(True)
                 logger.info("OneBot: reconnected to adapter service at %s", self._adapter_url)
                 # Re-push commands snapshot after reconnect so the adapter has
                 # the latest registry even across WS drops.
@@ -684,7 +702,7 @@ class OneBotAdapter(BasePlatformAdapter):  # type: ignore[misc]
         except Exception:
             logger.exception("OneBot: receive loop crashed")
         finally:
-            self._is_connected = False
+            self._set_connection_state(False)
             logger.warning("OneBot: receive loop ended")
 
     async def _handle_text(self, raw: str) -> None:
@@ -805,6 +823,10 @@ class OneBotAdapter(BasePlatformAdapter):  # type: ignore[misc]
         if self._media_delivery_mode == "cache" and raw_media_items:
             media_urls, media_types = await self._cache_media_items(raw_media_items)
 
+        # 0.19 MessageEvent has no chat_id/user_id/user_name/is_group/platform
+        # top-level fields (gateway/platforms/base.py:1758-1823); identity is
+        # carried exclusively on ``source``.  Keep it that way — adding these
+        # as constructor kwargs raises TypeError on 0.19.
         message_event = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
@@ -927,6 +949,11 @@ class OneBotAdapter(BasePlatformAdapter):  # type: ignore[misc]
         text = str(getattr(event, "text", "") or "")
         if not chat_id.startswith("group:"):
             return
+        # Every slash command suppresses idle: 0.19 dispatches each resolvable
+        # command through hermes_cli.commands.should_bypass_active_session
+        # (gateway/platforms/base.py:4808), which is broader than the
+        # stop/new/reset interrupt trio.  The adapter service owns the delayed
+        # /stop|/new|/reset idle cleanup, so this plugin needs no command table.
         if text.lstrip().startswith("/"):
             return
         try:
@@ -1282,8 +1309,12 @@ class OneBotAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 if not result.get("success"):
                     return SendResult(
                         success=False,
+                        message_id=last_id,
                         error=result.get("error", "unknown send error"),
-                        retryable=True,
+                        # Honour an adapter-declared non-retryable failure
+                        # (e.g. UploadOutcomeUnknownError); default to retry
+                        # for transport errors, matching the previous policy.
+                        retryable=bool(result.get("retryable", True)),
                     )
                 last_id = result.get("message_id", last_id)
             return SendResult(success=True, message_id=last_id)
@@ -1324,6 +1355,42 @@ class OneBotAdapter(BasePlatformAdapter):  # type: ignore[misc]
             return _result_to_send_result(result)
         except Exception as exc:
             logger.warning("send_image failed: %s", exc)
+            return SendResult(success=False, error=str(exc), retryable=True)
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Send a local image file natively (Hermes 0.19 contract).
+
+        Hermes 0.19 routes cached ``MEDIA:`` images and every ``file://`` entry
+        of ``send_multiple_images`` through this method
+        (``gateway/platforms/base.py:3357-3363``, signature at ``3584-3610``).
+        Without the override the base fallback posts "Couldn't deliver the image
+        attachment" as text.  OneBot accepts local paths directly, so reuse the
+        existing ``send_image`` WS action instead of adding a new frame type.
+        ``**kwargs`` keeps parity with the base signature for callers that pass
+        extra Telegram/Discord-style options (e.g. ``thread_id`` in metadata).
+        """
+        try:
+            logger.debug(
+                "OneBot plugin send_image_file: chat_id=%s path=%s",
+                chat_id, sanitize_for_log(image_path, key="image_path"),
+            )
+            payload: dict[str, Any] = {"chat_id": chat_id, "image_url": image_path}
+            if caption:
+                payload["caption"] = strip_markdown(caption)
+            if reply_to:
+                payload["reply_to"] = reply_to
+            result = await self._request("send_image", **payload)
+            return _result_to_send_result(result)
+        except Exception as exc:
+            logger.warning("send_image_file failed: %s", exc)
             return SendResult(success=False, error=str(exc), retryable=True)
 
     async def send_voice(
@@ -1467,9 +1534,9 @@ def is_connected(config) -> bool:
     Part of the Hermes plugin registration contract (``register_platform``).
     Validates the *configuration* (is the adapter reachable in principle),
     not the live WS connection status.  A configured-but-not-running adapter
-    will still return True.  Actual liveness is tracked by ``_is_connected``
-    on the adapter instance and surfaced via the ``ready`` frame's
-    ``onebot_connected`` field.
+    will still return True.  Live liveness is the adapter instance's
+    ``is_connected`` property, backed by Hermes' ``_running`` flag and kept in
+    sync through ``_set_connection_state()``.
     """
     return validate_config(config)
 

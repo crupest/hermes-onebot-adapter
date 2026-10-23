@@ -2030,15 +2030,53 @@ def _wrap_hermes_handler(
     return wrapped
 
 
+def _load_tool_allowlist() -> tuple[set[str], tuple[str, ...]]:
+    """Return an optional exact/prefix allowlist for OneBot tool registration.
+
+    When either list is non-empty, every tool not matched by the allowlist is
+    hidden from Hermes. This is intentionally stricter than per-tool
+    ``tool_policies``: a missed deny entry cannot re-expose a dangerous tool.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        plugins = config.get("plugins", {}) if isinstance(config, dict) else {}
+        entries = plugins.get("entries", {}) if isinstance(plugins, dict) else {}
+        onebot = entries.get("onebot", {}) if isinstance(entries, dict) else {}
+        if not isinstance(onebot, dict):
+            return set(), ()
+        raw_exact = onebot.get("tool_allowlist", [])
+        raw_prefixes = onebot.get("tool_allowlist_prefixes", [])
+        exact = {str(item) for item in raw_exact} if isinstance(raw_exact, list) else set()
+        prefixes = tuple(str(item) for item in raw_prefixes) if isinstance(raw_prefixes, list) else ()
+        return exact, prefixes
+    except Exception as exc:
+        logger.warning("Failed to load OneBot tool allowlist, using defaults: %s", exc)
+        return set(), ()
+
+
 def register_tools(ctx) -> None:
     """Register the globally visible Hermes tools with execution-time policy wrappers."""
     policies = _load_tool_policies()
+    allowlist, allowlist_prefixes = _load_tool_allowlist()
+    filtered = bool(allowlist or allowlist_prefixes)
     for name, handler, schema in _TOOLS:
         policy = policies.get(name, {})
         registered = policy.get("registered", default_tool_registered(name))
         permission = policy.get("permission", default_tool_permission(name))
         if not isinstance(registered, bool):
             registered = default_tool_registered(name)
+        if filtered:
+            matched = name in allowlist or name.startswith(allowlist_prefixes)
+            if not matched:
+                logger.info("OneBot tool hidden by allowlist: %s", name)
+                continue
+            # An explicit allowlist entry means "make this available", even for
+            # tools in the upstream default-hidden set. An explicit policy
+            # registered:false still wins.
+            if "registered" not in policy:
+                registered = True
         if not registered:
             logger.info("OneBot tool hidden by policy: %s", name)
             continue

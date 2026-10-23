@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### 新增（crupest fork）
+- 群活跃窗口：`@`/关键词触发或成功出站后 N 秒内，非 @ 群消息进入上下文；窗外静默丢弃；支持群级覆盖
+- 通知上下文：戳一戳、入群/退群暂存为 `[系统]`，只在下一条被接受消息前注入，不单独唤醒
+- 只对显式 @bot 消息贴表情：`reaction_emoji_mention_only`（默认 true，支持群级覆盖）
+- `/reset`、`/new` 清空窗口/通知缓存，并加 5 秒 quiet period，避免确认消息重新打开窗口
+- adapter `api_call` action allowlist：发送/查询/上传/表情/点赞/已读/self-profile 之外的管理 action 拒绝
+- Hermes 工具注册 allowlist：未匹配工具不注册；self-profile 工具单独放行
+- self-profile：`onebot_set_avatar`、`onebot_set_qq_profile`、`onebot_set_group_card`；`set_group_card` 强制目标为 bot 自身
+- Hermes 0.19 兼容：connection state、MessageEvent source-only、`send_image_file`、send retryable、config 文件锁 Windows
+- MockOneBot / FakeHermesPlugin、窗口/通知/权限/协议集成测试
+
+### 变更
+- 安装器允许 POSIX 路径在 Windows 下解析，并禁止 `/etc`、`/proc`、`/sys`、整个 `/tmp`
+- `.env` 原子写入固定 0600
+- `__main__` 初始化 token 读取改用 `.get`，缺字段不再 KeyError
+
 ## [1.8.0] - 2026-09-02
 
 ### 新增

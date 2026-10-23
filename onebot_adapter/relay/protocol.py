@@ -115,6 +115,7 @@ class NormalizedEvent:
     real_seq: str = ""
     media_items: list[MediaItem] = field(default_factory=list)
     is_system_notice: bool = False  # True=合成系统事件(notice 转文本),插件侧据此设 internal=True
+    is_mention: bool = False  # True=消息包含 @bot(显式触发,用于活跃窗口续期判定)
     rate_limit_eligible: bool = True  # 仅适配器内部使用,不写入 plugin 协议
     delivery_id: str = ""
     delivery_ids: list[str] = field(default_factory=list)
@@ -136,6 +137,7 @@ class NormalizedEvent:
             "real_seq": self.real_seq,
             "media_items": [m.to_dict() for m in self.media_items],
             "is_system_notice": self.is_system_notice,
+            "is_mention": self.is_mention,
             "delivery_id": self.delivery_id,
             "delivery_ids": list(self.delivery_ids or ([self.delivery_id] if self.delivery_id else [])),
         }

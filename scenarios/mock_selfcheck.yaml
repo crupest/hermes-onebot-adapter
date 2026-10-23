@@ -1,0 +1,22 @@
+# Scenario: MockOneBot self-check against a test double of the adapter.
+#
+# Used by tests/integration/test_mock_onebot.py; also handy as a smoke test for
+# the CLI itself (the fake adapter answers get_login_info and replies to the
+# injected event with send_group_msg).
+name: mock-selfcheck
+steps:
+  - send_event:
+      type: group_message
+      group_id: 42
+      user_id: 100
+      text: "ping"
+      at: true
+  - sleep: 0.3
+  - expect_api:
+      - action: get_login_info
+  - expect:
+      send_count: 1
+      sends:
+        - action: send_group_msg
+          group_id: 42
+          text_contains: "自动回复"

@@ -30,6 +30,12 @@ from onebot_adapter.config import MEDIA_DELIVERY_CACHE, AdapterConfig
 from onebot_adapter.logging_utils import text_summary
 from onebot_adapter.onebot import segments as seg
 from onebot_adapter.relay.protocol import DroppedEvent, FilteredEvent, MediaItem, NormalizedEvent
+from onebot_adapter.window import (
+    NoticeBuffer,
+    WindowStore,
+    notice_buffer_for,
+    window_store_for,
+)
 
 if TYPE_CHECKING:
     from onebot_adapter.onebot.name_resolver import NameResolver
@@ -37,6 +43,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MAX_FORWARD_DEPTH = 4
+
+# /new and /reset end the current Hermes session; the adapter closes that
+# group's active window and discards buffered notices at the same time.
+_SESSION_RESET_COMMANDS = frozenset({"new", "reset"})
 
 _AT_PATTERN = re.compile(r"@(\d{5,11})")
 
@@ -91,6 +101,8 @@ class _ParseOptions:
     media_delivery_mode: str
     bot_blacklist_match_fn: Callable[[str, str | None], Any] | None
     is_friend_fn: Callable[[str], Any] | None
+    window_store: WindowStore | None = None
+    notice_buffer: NoticeBuffer | None = None
 
 
 @dataclass
@@ -106,6 +118,8 @@ class _MessageState:
     chat_name: str
     group_name: str
     raw_segments: list[dict]
+    is_mention: bool = False
+    command_name: str = ""
 
 
 # ── Placeholder rendering ────────────────────────────────────────────────
@@ -356,6 +370,8 @@ async def parse_event(
     media_delivery_mode: str = MEDIA_DELIVERY_CACHE,
     bot_blacklist_match_fn: Callable[[str, str | None], Any] | None = None,
     is_friend_fn: Callable[[str], Any] | None = None,
+    window_store: WindowStore | None = None,
+    notice_buffer: NoticeBuffer | None = None,
 ) -> NormalizedEvent | FilteredEvent | DroppedEvent | None:
     """Parse a OneBot 11 message event.
 
@@ -401,8 +417,22 @@ async def parse_event(
     keyword triggering (any-position unless ``keyword_first_only`` requires
     the keyword at the text start). A message triggers if it satisfies any
     enabled check (OR). If no check is enabled, all messages pass through.
+
+    Active window: when *window_store* is supplied (or bound to *config* via
+    :func:`onebot_adapter.window.bind_window_context`), an accepted group
+    message is also allowed when the group's active window is open, even
+    without an @/keyword.  @/keyword triggers and pass-all groups touch the
+    window; passive in-window messages do not, so the window cannot slide
+    forever.  The window check happens before reply/forward context or media
+    processing, so dropped messages trigger no API calls.  Buffered notices
+    (:class:`NoticeBuffer`) are drained into the text as ``[系统] ...`` lines
+    for the next accepted ordinary group message.  ``/new`` and ``/reset``
+    clear both stores for that group.  Without a window store the previous
+    trigger/notice behaviour is preserved (used by legacy callers and tests).
     """
     post_type = event.get("post_type")
+    store = window_store if window_store is not None else window_store_for(config)
+    buffer = notice_buffer if notice_buffer is not None else notice_buffer_for(config)
     if post_type == "notice":
         return await _parse_notice_event(
             event,
@@ -411,6 +441,8 @@ async def parse_event(
             name_resolver=name_resolver,
             bot_blacklist_match_fn=bot_blacklist_match_fn,
             is_friend_fn=is_friend_fn,
+            window_store=store,
+            notice_buffer=buffer,
         )
     if post_type != "message":
         return None
@@ -429,6 +461,8 @@ async def parse_event(
         media_delivery_mode=media_delivery_mode,
         bot_blacklist_match_fn=bot_blacklist_match_fn,
         is_friend_fn=is_friend_fn,
+        window_store=store,
+        notice_buffer=buffer,
     )
     state = await _prepare_message_state(event, options)
     if isinstance(state, (DroppedEvent, FilteredEvent)):
@@ -438,12 +472,26 @@ async def parse_event(
     filtered = _filter_message(event, state, options)
     if filtered is not None:
         return filtered
+    # /new and /reset start a fresh session: close the group's active window
+    # and discard buffered notices before rendering (no media/context API
+    # calls are made for a reset command).
+    if (
+        state.is_group
+        and state.command_name in _SESSION_RESET_COMMANDS
+        and options.window_store is not None
+    ):
+        options.window_store.clear(state.group_id)
+        if options.notice_buffer is not None:
+            options.notice_buffer.clear(state.group_id)
     text, reply_to_id, reply_to_text, media_items = await _render_message(event, state, options)
     if not text:
         return _drop_event(
             "empty", event, is_group=state.is_group, sender_id=state.sender_id,
             sender_name=state.sender_name, group_id=state.group_id,
         )
+    notice_context = _drain_notice_context(state, options, text)
+    if notice_context:
+        text = f"{notice_context}\n{text}"
 
     norm = NormalizedEvent(
         message_id=str(event.get("message_id", "")),
@@ -460,6 +508,7 @@ async def parse_event(
         chat_name=state.chat_name,
         real_seq=str(event.get("real_seq", "") or ""),
         media_items=media_items,
+        is_mention=state.is_mention,
     )
     logger.debug(
         "parse_event: normalized chat_id=%s text=%s",
@@ -511,6 +560,17 @@ async def _prepare_message_state(
         )
         if blocked is not None:
             return blocked
+    raw_segments: list[dict] = event.get("message", []) or []
+    is_mention = False
+    if is_group and options.config is not None and options.window_store is not None:
+        state = _prepare_windowed_group_state(
+            event, options, raw_segments, sender_id, sender_name, group_id,
+        )
+        if state is None or isinstance(state, (DroppedEvent, FilteredEvent)):
+            return state
+        return await _finish_message_state(
+            state, options, raw_segments, is_group, group_id,
+        )
     settings = await _resolved_message_settings(options, is_group, group_id, sender_id)
     if settings is None:
         return _drop_event(
@@ -518,7 +578,6 @@ async def _prepare_message_state(
             sender_name=sender_name, group_id=group_id,
         )
     require_mention, mention_first, keywords, keyword_first, strip_mention, is_admin, is_global_admin, mode = settings
-    raw_segments: list[dict] = event.get("message", []) or []
     if is_group and not _passes_group_trigger(
         raw_segments,
         options.self_id,
@@ -530,6 +589,11 @@ async def _prepare_message_state(
         return _drop_event(
             "mention", event, is_group=is_group, sender_id=sender_id,
             sender_name=sender_name, group_id=group_id,
+        )
+    if is_group and options.self_id:
+        is_mention = (
+            seg.has_bot_mention_first(raw_segments, options.self_id) if mention_first
+            else seg.has_bot_mention(raw_segments, options.self_id)
         )
     command_name = _extract_command_name(raw_segments, options.self_id)
     if is_group and options.self_id and (strip_mention or command_name):
@@ -552,7 +616,149 @@ async def _prepare_message_state(
         chat_name=chat_name,
         group_name=group_name,
         raw_segments=raw_segments,
+        is_mention=is_mention,
+        command_name=command_name or "",
     )
+
+
+def _prepare_windowed_group_state(
+    event: dict[str, Any],
+    options: _ParseOptions,
+    raw_segments: list[dict],
+    sender_id: str,
+    sender_name: str,
+    group_id: str,
+) -> _MessageState | DroppedEvent | FilteredEvent | None:
+    """Group trigger gating for the active-window path.
+
+    Order is locked: group enabled → @/keyword/window-active → member filter.
+    The window is only touched by messages that are accepted *and* explicitly
+    triggered (or by pass-all groups); a passive in-window message must not
+    slide the window forward, otherwise a chatty group would never close it.
+    """
+    config = options.config
+    assert config is not None
+    if not config.get_group_config(group_id).enabled:
+        return _drop_event(
+            "user_filter", event, is_group=True, sender_id=sender_id,
+            sender_name=sender_name, group_id=group_id,
+        )
+    require_mention = config.resolve_require_mention(group_id)
+    mention_first = config.resolve_mention_first_only(group_id)
+    keywords = config.resolve_trigger_keywords(group_id)
+    keyword_first = config.resolve_keyword_first_only(group_id)
+    is_mention, keyword_triggered = _group_trigger_flags(
+        raw_segments, options.self_id, mention_first, keywords, keyword_first,
+    )
+    required = _group_trigger_required(require_mention, keywords, options.self_id)
+    window_enabled = config.resolve_active_window_enabled(group_id)
+    window_ttl = config.resolve_active_window_seconds(group_id)
+    window_active = bool(
+        window_enabled
+        and options.window_store is not None
+        and options.window_store.active(group_id, ttl_seconds=window_ttl)
+    )
+    triggered = (not required) or keyword_triggered or (require_mention and is_mention)
+    if not triggered and not window_active:
+        return _drop_event(
+            "trigger", event, is_group=True, sender_id=sender_id,
+            sender_name=sender_name, group_id=group_id,
+        )
+    if not config.is_group_user_allowed(group_id, sender_id):
+        return _drop_event(
+            "user_filter", event, is_group=True, sender_id=sender_id,
+            sender_name=sender_name, group_id=group_id,
+        )
+    if window_enabled and options.window_store is not None:
+        if not required or keyword_triggered or is_mention:
+            options.window_store.touch(group_id, ttl_seconds=window_ttl)
+    return _MessageState(
+        is_group=True,
+        sender_id=sender_id,
+        sender_name=sender_name,
+        group_id=group_id,
+        is_admin=config.is_admin(sender_id, group_id),
+        is_global_admin=sender_id in config.global_admins,
+        include_url=config.media_delivery_mode != MEDIA_DELIVERY_CACHE,
+        chat_id=f"group:{group_id}",
+        chat_name="",
+        group_name="",
+        raw_segments=raw_segments,
+        is_mention=is_mention,
+        command_name="",
+    )
+
+
+async def _finish_message_state(
+    state: _MessageState,
+    options: _ParseOptions,
+    raw_segments: list[dict],
+    is_group: bool,
+    group_id: str,
+) -> _MessageState:
+    """Strip the trigger @ and resolve group display metadata."""
+    strip_mention = False
+    if options.config is not None:
+        strip_mention = options.config.resolve_strip_first_mention(group_id)
+    command_name = _extract_command_name(raw_segments, options.self_id)
+    if is_group and options.self_id and (strip_mention or command_name):
+        raw_segments = seg.strip_first_bot_mention(raw_segments, options.self_id)
+    group_name = ""
+    if options.name_resolver is not None:
+        group_name = await options.name_resolver.resolve_group_name(group_id)
+    chat_name = f"{group_id}({group_name})" if group_name else group_id
+    state.raw_segments = raw_segments
+    state.command_name = command_name or ""
+    state.group_name = group_name
+    state.chat_name = chat_name
+    return state
+
+
+def _group_trigger_flags(
+    raw_segments: list[dict],
+    self_id: str,
+    mention_first: bool,
+    keywords: list[str] | None,
+    keyword_first: bool,
+) -> tuple[bool, bool]:
+    """Return ``(is_mention, keyword_triggered)`` for a group message."""
+    is_mention = False
+    if self_id:
+        is_mention = (
+            seg.has_bot_mention_first(raw_segments, self_id) if mention_first
+            else seg.has_bot_mention(raw_segments, self_id)
+        )
+    keyword_triggered = False
+    if keywords:
+        plain_text = seg.extract_text(raw_segments)
+        keyword_triggered = (
+            any(plain_text.startswith(keyword) for keyword in keywords) if keyword_first
+            else any(keyword in plain_text for keyword in keywords)
+        )
+    return is_mention, keyword_triggered
+
+
+def _group_trigger_required(require_mention: bool, keywords: list[str] | None, self_id: str) -> bool:
+    """Whether the group config demands an explicit @ or keyword trigger."""
+    return bool((require_mention and self_id) or keywords)
+
+
+def _drain_notice_context(state: _MessageState, options: _ParseOptions, text: str) -> str:
+    """Drain buffered system notices for an accepted ordinary group message.
+
+    Slash commands never consume the buffer: a command is a control message,
+    not conversational context, so notices stay pending for the next normal
+    message (``/reset`` and ``/new`` clear the buffer explicitly instead).
+    """
+    if not state.is_group or state.command_name or text.startswith("/"):
+        return ""
+    if options.notice_buffer is None or options.window_store is None:
+        return ""
+    ttl_seconds = None
+    if options.config is not None:
+        ttl_seconds = options.config.resolve_active_window_seconds(state.group_id)
+    lines = options.notice_buffer.drain(state.group_id, ttl_seconds=ttl_seconds)
+    return "\n".join(lines)
 
 
 async def _lookup_dm_reject_reason(
@@ -1019,8 +1225,10 @@ async def _parse_notice_event(
     name_resolver: NameResolver | None = None,
     bot_blacklist_match_fn: Callable[[str, str | None], Any] | None = None,
     is_friend_fn: Callable[[str], Any] | None = None,
+    window_store: WindowStore | None = None,
+    notice_buffer: NoticeBuffer | None = None,
 ) -> NormalizedEvent | FilteredEvent | DroppedEvent | None:
-    """Parse a OneBot 11 notice event into a synthetic NormalizedEvent.
+    """Parse a OneBot 11 notice event.
 
     Handles three notice types (when enabled via config):
       * ``notify/poke`` — bot 被戳 (target_id == self_id);群聊和私聊都处理。
@@ -1030,11 +1238,13 @@ async def _parse_notice_event(
     All other notice types are ignored (return None).
 
     戳一戳走群用户过滤和私聊准入(模式+常驻黑白名单);成员变动不走用户过滤。
-    所有合成事件设置 ``is_system_notice=True``,插件侧据此设 ``internal=True``。
 
-    Returns:
-        * :class:`NormalizedEvent` for enabled notice types.
-        * ``None`` for disabled/unhandled notice types, or when filtered out.
+    With an active-window store wired in (the production path), enabled
+    notices are **never** forwarded as events: a group notice is appended to
+    :class:`NoticeBuffer` while that group's window is open and discarded
+    otherwise, so it can never wake the agent.  Without a store (legacy /
+    unit-test callers) the previous synthetic ``NormalizedEvent`` behaviour is
+    preserved.
     """
     notice_type = event.get("notice_type")
     sub_type = event.get("sub_type", "")
@@ -1066,7 +1276,13 @@ async def _parse_notice_event(
         if blocked is not None:
             return blocked
 
-    # ── Resolve user name ──
+    if window_store is not None:
+        return await _buffer_notice(
+            kind, sub_type, config, group_id, is_group, user_id,
+            name_resolver, window_store, notice_buffer,
+        )
+
+    # ── Legacy path: synthesize an event (no window store wired) ──
     user_name = ""
     if name_resolver is not None and user_id:
         user_name = await name_resolver.resolve(user_id, group_id if is_group else "")
@@ -1099,6 +1315,44 @@ async def _parse_notice_event(
         chat_name=chat_name,
         is_system_notice=True,
         rate_limit_eligible=kind == "poke",
+    )
+
+
+async def _buffer_notice(
+    kind: str,
+    sub_type: str,
+    config: AdapterConfig,
+    group_id: str,
+    is_group: bool,
+    user_id: str,
+    name_resolver: NameResolver | None,
+    window_store: WindowStore,
+    notice_buffer: NoticeBuffer | None,
+) -> None:
+    """Store a group notice as context while the group's window is open.
+
+    Returns ``None`` in every case: notices must never be forwarded as
+    events (that is what used to wake the agent).  DM pokes and closed
+    windows are silently discarded; only a group with an open window keeps
+    the notice, and only when a buffer is wired.
+    """
+    if not is_group or notice_buffer is None:
+        return
+    if not config.resolve_active_window_enabled(group_id):
+        return
+    ttl_seconds = config.resolve_active_window_seconds(group_id)
+    if not window_store.active(group_id, ttl_seconds=ttl_seconds):
+        logger.debug("parse_notice: window inactive kind=%s group=%s — discarded", kind, group_id)
+        return
+    user_name = ""
+    if name_resolver is not None and user_id:
+        user_name = await name_resolver.resolve(user_id, group_id)
+    display = user_name or user_id
+    body = _notice_body(kind, sub_type, display, user_id)
+    notice_buffer.add(group_id, body)
+    logger.debug(
+        "parse_notice: buffered kind=%s group=%s user_id=%s text=%r",
+        kind, group_id, user_id, body,
     )
 
 
@@ -1180,7 +1434,8 @@ async def _resolve_notice_chat(
     return f"group:{group_id}", "group", chat_name
 
 
-def _notice_text(kind: str, sub_type: str, display: str, user_id: str) -> str:
+def _notice_body(kind: str, sub_type: str, display: str, user_id: str) -> str:
+    """Human-readable notice body (without the ``[系统]`` prefix)."""
     if kind == "poke":
         action = "戳了戳你"
     elif kind == "member_join":
@@ -1189,4 +1444,8 @@ def _notice_text(kind: str, sub_type: str, display: str, user_id: str) -> str:
         action = "被管理员移出了群聊"
     else:
         action = "退出了群聊"
-    return f"[系统] 用户 {display}({user_id}) {action}"
+    return f"用户 {display}({user_id}) {action}"
+
+
+def _notice_text(kind: str, sub_type: str, display: str, user_id: str) -> str:
+    return f"[系统] {_notice_body(kind, sub_type, display, user_id)}"

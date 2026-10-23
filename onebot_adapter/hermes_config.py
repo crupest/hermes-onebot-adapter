@@ -87,23 +87,36 @@ class HermesConfigParseError(Exception):
 def _locked(config_path: Path):
     """对 config.yaml 加文件锁(进程级),避免与 Hermes 网关并发写互相覆盖。
 
-    使用 ``fcntl.flock`` 阻塞式排他锁,作用域为本上下文。Linux/macOS 可用;
-    Windows 无 flock 但有 msvcrt,此处仅支持 POSIX(适配器部署目标)。
+    POSIX 用 ``fcntl.flock``;Windows 开发环境用 ``msvcrt.locking``。
     """
-    import fcntl
-
     lock_path = config_path.with_suffix(config_path.suffix + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(lock_path, "w")
+    fh = open(lock_path, "a+")
     locked = False
     try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        if os.name == "nt":
+            import msvcrt
+
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         locked = True
         yield
     finally:
         if locked:
             try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                if os.name == "nt":
+                    import msvcrt
+
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
             except OSError:
                 pass
         fh.close()

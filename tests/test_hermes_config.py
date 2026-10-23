@@ -376,6 +376,11 @@ def test_list_available_toolsets_unimportable_returns_error(monkeypatch, tmp_pat
     # sys.path 里的 hermes-agent 目录,确保 import 真正失败而非命中缓存的真实模块。
     polluted = [k for k in list(sys.modules) if k == "toolsets" or k.startswith("hermes_cli")]
     saved = {k: sys.modules.pop(k) for k in polluted if k in sys.modules}
+    # Hermes may be installed in site-packages (integration environment); a
+    # plain sys.path edit cannot make the import fail there. A None sentinel
+    # forces ImportError regardless of installation location.
+    sys.modules["hermes_cli"] = None
+    sys.modules["toolsets"] = None
     hermes_agent = Path("/home/alec/.hermes/hermes-agent").resolve()
     original_path = [p for p in sys.path if p and Path(p).resolve() != hermes_agent]
     monkeypatch.setattr(sys, "path", original_path)
@@ -384,6 +389,9 @@ def test_list_available_toolsets_unimportable_returns_error(monkeypatch, tmp_pat
         assert "error" in result
         assert "detail" in result
     finally:
+        for sentinel in ("hermes_cli", "toolsets"):
+            if sys.modules.get(sentinel) is None:
+                sys.modules.pop(sentinel, None)
         for k, mod in saved.items():
             if k not in sys.modules:
                 sys.modules[k] = mod
@@ -626,6 +634,8 @@ def test_list_available_toolsets_subprocess_fails_to_syspath(monkeypatch, tmp_pa
     # 清理 sys.modules 确保 import 真正失败
     polluted = [k for k in list(sys.modules) if k == "toolsets" or k.startswith("hermes_cli")]
     saved = {k: sys.modules.pop(k) for k in polluted if k in sys.modules}
+    sys.modules["hermes_cli"] = None
+    sys.modules["toolsets"] = None
     hermes_agent = Path("/home/alec/.hermes/hermes-agent").resolve()
     original_path = [p for p in sys.path if p and Path(p).resolve() != hermes_agent]
     monkeypatch.setattr(sys, "path", original_path)
@@ -634,6 +644,9 @@ def test_list_available_toolsets_subprocess_fails_to_syspath(monkeypatch, tmp_pa
         assert "error" in result
         assert "detail" in result
     finally:
+        for sentinel in ("hermes_cli", "toolsets"):
+            if sys.modules.get(sentinel) is None:
+                sys.modules.pop(sentinel, None)
         for k, mod in saved.items():
             if k not in sys.modules:
                 sys.modules[k] = mod

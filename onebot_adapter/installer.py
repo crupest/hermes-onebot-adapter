@@ -10,7 +10,7 @@ import logging
 import os
 import stat
 from collections.abc import Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
@@ -48,11 +48,26 @@ def _is_forbidden_system_path(resolved: Path) -> bool:
     return False
 
 
+def _is_forbidden_posix_raw(raw: str) -> bool:
+    """True for POSIX /etc, /proc, /sys even when running on Windows.
+
+    ``Path`` is drive-relative on Windows, so the resolved path loses the POSIX
+    meaning of a value such as ``/etc``. Check the raw spelling as well.
+    """
+    posix = PurePosixPath(raw.strip())
+    return posix.is_absolute() and len(posix.parts) >= 2 and posix.parts[1] in _FORBIDDEN_SYSTEM_NAMES
+
+
 def _expand_absolute(raw: str) -> Path | None:
     expanded = Path(raw).expanduser()
-    if not expanded.is_absolute():
-        return None
-    return expanded
+    if expanded.is_absolute():
+        return expanded
+    # Defaults and documented examples use POSIX absolute paths. On Windows
+    # ``PureWindowsPath("/tmp/x").is_absolute()`` is False, so map them onto the
+    # current drive instead of rejecting every POSIX-style config value.
+    if os.name == "nt" and raw.startswith("/"):
+        return Path(os.path.abspath(raw))
+    return None
 
 
 def validate_hermes_extra_root(root: str) -> str | None:
@@ -60,6 +75,8 @@ def validate_hermes_extra_root(root: str) -> str | None:
     expanded = _expand_absolute(root)
     if expanded is None:
         return f"hermes_install_allowed_roots entry must be an absolute path: {root}"
+    if _is_forbidden_posix_raw(root):
+        return f"hermes_install_allowed_roots entry is a forbidden system path: {root}"
     resolved = expanded.resolve(strict=False)
     if _is_forbidden_system_path(resolved):
         return f"hermes_install_allowed_roots entry is a forbidden system path: {root}"
@@ -71,6 +88,10 @@ def validate_upload_root(root: str) -> str | None:
     expanded = _expand_absolute(root)
     if expanded is None:
         return "automation_upload_allowed_roots entries must be absolute paths"
+    if _is_forbidden_posix_raw(root):
+        return f"automation_upload_allowed_roots must not include system roots: {root}"
+    if PurePosixPath(root.strip()) == PurePosixPath("/tmp"):
+        return "automation_upload_allowed_roots must not be the whole /tmp directory"
     resolved = expanded.resolve(strict=False)
     if _is_forbidden_system_path(resolved):
         return f"automation_upload_allowed_roots must not include system roots: {root}"
@@ -195,7 +216,9 @@ def _persist_env(env_path: Path, env: dict[str, str]) -> None:
             lines.append(f"{k}={v}")
     env_path.parent.mkdir(parents=True, exist_ok=True)
     payload = ("\n".join(lines) + "\n").encode("utf-8")
-    _atomic_write_nofollow(env_path, payload)
+    # .env holds the adapter WS token; keep it owner-only even when an older
+    # install created a world-readable file.
+    _atomic_write_nofollow(env_path, payload, mode=0o600)
 
 
 def _write_env(env_path: Path, updates: dict[str, str]) -> dict[str, str]:
@@ -212,14 +235,14 @@ def _write_env(env_path: Path, updates: dict[str, str]) -> dict[str, str]:
     return env
 
 
-def _atomic_write_nofollow(dest: Path, data: bytes) -> None:
+def _atomic_write_nofollow(dest: Path, data: bytes, *, mode: int = 0o644) -> None:
     """Write *data* to *dest* without following a pre-planted symlink."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(f".{dest.name}.tmp.{os.getpid()}.{os.urandom(4).hex()}")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    fd = os.open(tmp, flags, 0o644)
+    fd = os.open(tmp, flags, mode)
     try:
         os.write(fd, data)
         os.fsync(fd)

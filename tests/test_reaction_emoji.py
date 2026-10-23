@@ -33,7 +33,7 @@ async def service(tmp_path, monkeypatch):
         await svc._session.close()
 
 
-def _group_event(msg_id: str = "100", chat_id: str = "group:42") -> NormalizedEvent:
+def _group_event(msg_id: str = "100", chat_id: str = "group:42", *, is_mention: bool = True) -> NormalizedEvent:
     return NormalizedEvent(
         message_id=msg_id,
         chat_id=chat_id,
@@ -41,6 +41,7 @@ def _group_event(msg_id: str = "100", chat_id: str = "group:42") -> NormalizedEv
         user_id="u1",
         user_name="Alice",
         text="hello",
+        is_mention=is_mention,
     )
 
 
@@ -100,6 +101,23 @@ async def test_enabled_group_calls_api(service):
     action, params = service._api.call.call_args.args
     assert action == "set_msg_emoji_like"
     assert params == {"message_id": 100, "emoji_id": "76", "group_id": 42}
+
+
+async def test_passive_group_message_does_not_react(service):
+    """Window-passive messages must not get the clap reaction."""
+    service.store.patch(reaction_emoji_enabled=True, reaction_emoji_mention_only=True)
+    service._relay._clients = {MagicMock(): MagicMock()}
+    service._api.call = AsyncMock(return_value={"retcode": 0, "data": {}})
+    await service._maybe_react_delivered(_group_event(is_mention=False))
+    service._api.call.assert_not_called()
+
+
+async def test_mention_only_off_reacts_to_passive_group_message(service):
+    service.store.patch(reaction_emoji_enabled=True, reaction_emoji_mention_only=False)
+    service._relay._clients = {MagicMock(): MagicMock()}
+    service._api.call = AsyncMock(return_value={"retcode": 0, "data": {}})
+    await service._maybe_react_delivered(_group_event(is_mention=False))
+    service._api.call.assert_called_once()
 
 
 async def test_enabled_dm_calls_api(service):

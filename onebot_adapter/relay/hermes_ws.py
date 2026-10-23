@@ -48,6 +48,7 @@ from onebot_adapter.relay.protocol import (
     ready_message,
     result_message,
 )
+from onebot_adapter.window import NoticeBuffer, WindowStore
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,58 @@ logger = logging.getLogger(__name__)
 # frame, it retries with a fresh ``req_id`` but identical payload — we hash the
 # payload (excluding ``req_id``) and short-circuit retries within the TTL.
 _DEDUP_ACTIONS = frozenset({"send_text", "send_image", "send_voice", "send_video", "send_document"})
+
+# Hard allowlist for plugin -> adapter ``api_call`` frames.  The plugin's tools
+# are the intended caller, but a terminal-enabled agent can read the plugin
+# token and open the same WS; this list is the enforcement point that keeps
+# moderation/destructive OneBot actions from being reached that way.
+_API_ALLOWED_EXACT = frozenset({
+    "send_msg",
+    "send_group_msg",
+    "send_private_msg",
+    "send_forward_msg",
+    "send_group_forward_msg",
+    "send_private_forward_msg",
+    "forward_group_single_msg",
+    "forward_friend_single_msg",
+    "upload_group_file",
+    "upload_private_file",
+    "set_msg_emoji_like",
+    "mark_msg_as_read",
+    "send_like",
+    "send_poke",
+    "adapter_get_bot_blacklist",
+    # Self-only profile actions. `set_group_card` is additionally guarded by
+    # api_call_target_allowed() below so it can only target the bot itself.
+    "set_qq_profile",
+    "set_qq_avatar",
+    "set_group_card",
+})
+_API_ALLOWED_PREFIXES = ("get_", "fetch_", "nc_get_")
+
+
+def api_action_allowed(action: str) -> bool:
+    """True when *action* is a read-only or messaging OneBot action."""
+    if not action:
+        return False
+    if action in _API_ALLOWED_EXACT:
+        return True
+    return action.startswith(_API_ALLOWED_PREFIXES)
+
+
+def api_call_target_allowed(action: str, params: object, self_id: object) -> bool:
+    """Keep self-profile actions limited to the bot account.
+
+    `set_qq_profile` / `set_qq_avatar` have no target parameter; they always
+    affect the bot. `set_group_card` accepts a user_id and could otherwise be
+    used to change another member's card, so require it to equal self_id.
+    """
+    if action != "set_group_card":
+        return True
+    if not isinstance(params, dict):
+        return False
+    target = str(params.get("user_id", "")).strip()
+    return bool(target) and bool(self_id) and target == str(self_id)
 
 
 def _send_fingerprint(action: str, data: dict[str, Any]) -> str:
@@ -128,6 +181,9 @@ class HermesRelayServer:
     # only carries plugin/builtin slash commands, not generation-bumping ones.
     _INTERRUPT_COMMANDS = frozenset({"stop", "new", "reset"})
     _SESSION_RESET_COMMANDS = frozenset({"new", "reset"})
+    # After /new or /reset, ignore outbound window renewals for this long so the
+    # reset confirmation cannot immediately re-open the window it just closed.
+    _WINDOW_QUIET_SECONDS = 5.0
     # Max concurrent OneBot API send calls (send_group_msg / upload_*_file).
     # NapCat serializes API requests on a single WS, so unbounded concurrency
     # queues up at NapCat and inflates latency past the plugin's 30s
@@ -153,6 +209,8 @@ class HermesRelayServer:
         seq_map: SeqMap | None = None,
         name_resolver: NameResolver | None = None,
         local_api_call: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None,
+        window_store: WindowStore | None = None,
+        notice_buffer: NoticeBuffer | None = None,
     ) -> None:
         self._config = config
         self._api = api
@@ -164,6 +222,16 @@ class HermesRelayServer:
         self._seq_map = seq_map
         self._name_resolver = name_resolver
         self._local_api_call = local_api_call
+        # Shared per-group active window / notice context.  The service creates
+        # one pair and hands the same objects to the parser pipeline (bound to
+        # config) so inbound gating and outbound renewal see identical state.
+        self._window_store = window_store
+        self._notice_buffer = notice_buffer
+        # /reset and /new close the window, but Hermes answers the command with
+        # a confirmation message that would otherwise renew it immediately.
+        # Keep a short quiet period so the reset cannot be undone by its own
+        # reply (or by another immediate outbound frame).
+        self._window_quiet_until: dict[str, float] = {}
         self._clients: set[aiohttp.web.WebSocketResponse] = set()
         self._ring_buffer: deque[tuple[float, NormalizedEvent]] = deque(
             maxlen=self._RING_BUFFER_SIZE,
@@ -299,6 +367,60 @@ class HermesRelayServer:
     def latest_plugin_status(self) -> dict[str, Any] | None:
         """Latest bounded health/error summary reported by the Hermes plugin."""
         return dict(self._latest_plugin_status) if self._latest_plugin_status else None
+
+    @property
+    def window_store(self) -> WindowStore | None:
+        """Shared per-group active window (None when the service did not wire one)."""
+        return self._window_store
+
+    @property
+    def notice_buffer(self) -> NoticeBuffer | None:
+        """Shared per-group notice context buffer."""
+        return self._notice_buffer
+
+    def _touch_active_window(self, group_id: str) -> None:
+        """Renew a group's active window after a *successful* outbound send.
+
+        Callers must only invoke this from success paths: failed sends,
+        outbound-filter drops and adapter-local reject messages must not renew
+        the window (otherwise a NO_REPLY turn would keep the group awake).
+        """
+        if self._window_store is None or not group_id:
+            return
+        if not self._config.resolve_active_window_enabled(group_id):
+            return
+        quiet_until = self._window_quiet_until.get(group_id)
+        if quiet_until is not None:
+            if time.monotonic() < quiet_until:
+                return
+            self._window_quiet_until.pop(group_id, None)
+        self._window_store.touch(
+            group_id, ttl_seconds=self._config.resolve_active_window_seconds(group_id),
+        )
+
+    def _clear_window_context(self, group_id: str) -> None:
+        """Close a group's window and discard pending notice context."""
+        if self._window_store is not None:
+            self._window_store.clear(group_id)
+        if self._notice_buffer is not None:
+            self._notice_buffer.clear(group_id)
+        # Suppress renewal for the reset confirmation and any other frame sent
+        # while the session-reset turn is still finishing.
+        self._window_quiet_until[group_id] = time.monotonic() + self._WINDOW_QUIET_SECONDS
+
+    def _touch_active_window_after_api_send(self, action: str, params: dict[str, Any]) -> None:
+        """Renew the window when a tool-driven ``send_*_msg`` call succeeded."""
+        if action not in API_SEND_ACTIONS:
+            return
+        raw_gid = params.get("group_id")
+        if raw_gid in (None, ""):
+            return
+        self._touch_active_window(str(raw_gid))
+
+    @staticmethod
+    def _group_key_from_chat_id(chat_id: str) -> str:
+        """Bare group key from ``group:<gid>`` (preserves leading zeros)."""
+        return chat_id[len("group:"):] if chat_id.startswith("group:") else ""
 
     def _store_hermes_mode(self, group_sessions_per_user: bool) -> None:
         """缓存插件上报的 Hermes group_sessions_per_user 值。"""
@@ -583,6 +705,11 @@ class HermesRelayServer:
         """
         gid = self._group_id_of(event)
         command = self._command_name(event.text)
+        if gid is not None and command in self._SESSION_RESET_COMMANDS:
+            # /new and /reset start a fresh session: close the active window and
+            # drop buffered notice context even if the parser path did not
+            # (e.g. an event pushed directly into the relay).
+            self._clear_window_context(gid)
         if command == "clean" and self._config.event_queue_clean_command_enabled:
             cleared = 0
             released_busy = False
@@ -1201,6 +1328,9 @@ class HermesRelayServer:
                     async with self._send_api_semaphore:
                         resp = await self._api.send_private_msg(num_id, segs)
                 msg_id = str(resp.get("message_id", ""))
+                # 成功出站才续期:窗口只在 OneBot 确认发送成功后刷新。
+                if is_group:
+                    self._touch_active_window(self._group_key_from_chat_id(chat_id))
                 # 写入去重缓存:在 SeqMap/log 之前,确保后续步骤异常时重试仍能命中。
                 if dedup_key is not None:
                     self._send_cache[dedup_key] = (time.monotonic(), msg_id)
@@ -1285,6 +1415,11 @@ class HermesRelayServer:
             else:
                 await self._api.upload_private_file(num_id, file_ref, filename)
 
+        # 文件本体已上传成功即续期:即使 caption 发送失败,群里也已经有这条
+        # 出站消息,群活跃窗口应当保持。失败(异常)路径不会走到这里。
+        if is_group:
+            self._touch_active_window(str(num_id))
+
         caption_segs: list[dict] = []
         _append_reply_segment(caption_segs, data.get("reply_to"))
         if data.get("caption"):
@@ -1337,6 +1472,25 @@ class HermesRelayServer:
         params = data.get("params", {}) or {}
         logger.debug("relay api_call: action=%s req_id=%s", action, req_id)
         logger.debug("relay api_call params: %s", safe_json(params))
+        if not api_action_allowed(action):
+            logger.warning("relay api_call blocked by allowlist: action=%s req_id=%s", action, req_id)
+            await ws.send_json(result_message(
+                req_id, False,
+                error=f"action not allowed by adapter policy: {action}",
+                retryable=False,
+            ))
+            return
+        if not api_call_target_allowed(action, params, self._config.self_id):
+            logger.warning(
+                "relay api_call blocked by self-target policy: action=%s req_id=%s",
+                action, req_id,
+            )
+            await ws.send_json(result_message(
+                req_id, False,
+                error=f"action may only target the bot itself: {action}",
+                retryable=False,
+            ))
+            return
         req_token = outbound_log_req_id.set(str(req_id))
         try:
             if self._local_api_call is not None and action.startswith("adapter_"):
@@ -1358,6 +1512,7 @@ class HermesRelayServer:
                     "relay api_call result: action=%s ok=True data=%s",
                     action, safe_json(result.get("data")),
                 )
+                self._touch_active_window_after_api_send(action, params)
                 await ws.send_json(result_message(req_id, True, data=result.get("data")))
             except ob.UploadOutcomeUnknownError as exc:
                 logger.warning("api_call %s outcome unknown: %s", action, exc)

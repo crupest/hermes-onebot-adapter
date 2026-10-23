@@ -1,0 +1,38 @@
+# Scenario: notices inside the active window become [系统] context.
+#
+# Requires the adapter to have active_window_enabled=true (default) and the
+# notice switches enabled (notify_poke_enabled / notify_member_change_enabled)
+# when those legacy fields exist.  The @ message opens the window; the poke and
+# join notices must NOT wake the plugin.  They are buffered and prepended as
+# "[系统] ..." lines to the next accepted non-@ message.
+#
+#   python tools/mock_onebot.py --adapter-url ws://127.0.0.1:18800/onebot \
+#       --token <onebot_ws_token> --scenario scenarios/notice_prefix_in_window.yaml
+name: notice-prefix-in-window
+steps:
+  - send_event:
+      type: group_message
+      group_id: 42
+      user_id: 100
+      text: "在吗"
+      at: true
+  - sleep: 0.4
+  - send_event:
+      type: poke
+      group_id: 42
+      user_id: 100
+      target_id: 10000
+  - sleep: 0.2
+  - send_event:
+      type: member_join
+      group_id: 42
+      user_id: 101
+  - sleep: 0.2
+  - send_event:
+      type: group_message
+      group_id: 42
+      user_id: 101
+      text: "继续聊"
+  - sleep: 1.0
+  - expect:
+      no_sends: true

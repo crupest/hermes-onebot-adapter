@@ -133,6 +133,7 @@ class GroupConfig:
     group_user_list: list[str] = field(default_factory=list)  # 默认空：黑名单空=允许所有人
     message_show_group_id: bool | None = None
     reaction_emoji_enabled: bool | None = None  # None=跟随全局,True=在送达的消息上贴表情回应
+    reaction_emoji_mention_only: bool | None = None  # None=跟随全局,True=只对 @bot 的消息贴表情
     # ── /指令过滤（None=跟随全局）──
     command_filter_enabled: bool | None = None
     command_filter_unknown: bool | None = None
@@ -143,6 +144,10 @@ class GroupConfig:
     # ── notice 事件推送（None=跟随全局）──
     notify_poke_enabled: bool | None = None            # 戳一戳(bot 被戳)推送,None=跟随全局
     notify_member_change_enabled: bool | None = None   # 群成员进退群推送,None=跟随全局
+    # ── 群活跃窗口（None=跟随全局）──
+    active_window_enabled: bool | None = None          # 窗口内非@消息放行,None=跟随全局
+    active_window_seconds: float | None = None         # 窗口时长(秒),None=跟随全局
+    poke_as_trigger: bool | None = None                # 预留:戳 bot 唤醒,None=跟随全局(暂不实现)
     # ── 群聊消息限流（None=跟随全局群聊限流配置）──
     group_rate_limit_algorithm: str | None = None
     group_rate_limit_messages: int | None = None
@@ -231,6 +236,7 @@ class AdapterConfig:
     message_show_group_id: bool = True
     seq_map_size: int = 4500
     reaction_emoji_enabled: bool = True
+    reaction_emoji_mention_only: bool = True    # True=只回应 @bot 的消息,窗口内被动消息不贴表情
     reaction_emoji_id: str = "124"
     reaction_emoji_id_queued: str = "123"      # 消息排队时贴的表情ID,空=不贴表情
     file_upload_timeout: float = 600.0          # 群/私聊/闪传文件上传等待 NapCat 响应的秒数
@@ -282,6 +288,13 @@ class AdapterConfig:
     # ── notice 事件推送 ──
     notify_poke_enabled: bool = False               # 戳一戳(bot 被戳)推送开关
     notify_member_change_enabled: bool = False      # 群成员进退群推送开关
+
+    # ── 群活跃窗口 ──
+    # 窗口内(@ 触发或成功出站后 N 秒)非 @ 群消息照常转发,窗外静默丢弃,
+    # 用于群共享 session 下让 Agent 自主决定是否接话。
+    active_window_enabled: bool = True
+    active_window_seconds: float = 300.0
+    poke_as_trigger: bool = False                   # 预留:戳 bot 直接唤醒 Agent(暂不实现)
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -401,6 +414,14 @@ class AdapterConfig:
                 return gc.reaction_emoji_enabled
         return self.reaction_emoji_enabled
 
+    def resolve_reaction_emoji_mention_only(self, group_id: str | None = None) -> bool:
+        """是否只对 @bot 的消息贴表情。群配置非 None 时覆盖全局。"""
+        if group_id is not None:
+            gc = self.get_group_config(group_id)
+            if gc.reaction_emoji_mention_only is not None:
+                return gc.reaction_emoji_mention_only
+        return self.reaction_emoji_mention_only
+
     def resolve_group_rate_limit_algorithm(self, group_id: str) -> str:
         gc = self.get_group_config(group_id)
         return gc.group_rate_limit_algorithm or self.group_rate_limit_algorithm
@@ -434,6 +455,32 @@ class AdapterConfig:
             if gc.notify_member_change_enabled is not None:
                 return gc.notify_member_change_enabled
         return self.notify_member_change_enabled
+
+    # ── 群活跃窗口解析 ──
+
+    def resolve_active_window_enabled(self, group_id: str | None = None) -> bool:
+        """群活跃窗口总开关。群配置非 None 时覆盖全局。"""
+        if group_id is not None:
+            gc = self.get_group_config(group_id)
+            if gc.active_window_enabled is not None:
+                return gc.active_window_enabled
+        return self.active_window_enabled
+
+    def resolve_active_window_seconds(self, group_id: str | None = None) -> float:
+        """群活跃窗口时长(秒)。群配置非 None 时覆盖全局。"""
+        if group_id is not None:
+            gc = self.get_group_config(group_id)
+            if gc.active_window_seconds is not None:
+                return float(gc.active_window_seconds)
+        return float(self.active_window_seconds)
+
+    def resolve_poke_as_trigger(self, group_id: str | None = None) -> bool:
+        """戳 bot 唤醒开关(预留,当前不实现唤醒)。群配置非 None 时覆盖全局。"""
+        if group_id is not None:
+            gc = self.get_group_config(group_id)
+            if gc.poke_as_trigger is not None:
+                return gc.poke_as_trigger
+        return self.poke_as_trigger
 
     # ── /指令过滤解析 ──
 
@@ -591,6 +638,7 @@ def _validate_logging_and_runtime(cfg: AdapterConfig, errors: list[str]) -> None
         ("send_dedup_ttl_seconds", cfg.send_dedup_ttl_seconds, 0, "must be positive"),
         ("event_queue_max_per_chat", cfg.event_queue_max_per_chat, 1, "must be at least 1"),
         ("event_queue_idle_timeout", cfg.event_queue_idle_timeout, 0, "must be positive"),
+        ("active_window_seconds", cfg.active_window_seconds, 0, "must be positive"),
     )
     for name, value, minimum, message in minimum_rules:
         invalid = value < minimum if minimum else value <= minimum
@@ -604,7 +652,12 @@ def _validate_logging_and_runtime(cfg: AdapterConfig, errors: list[str]) -> None
     if not isinstance(cfg.file_upload_timeout, (int, float)) or isinstance(cfg.file_upload_timeout, bool) \
             or not 30 <= cfg.file_upload_timeout <= 600:
         errors.append("file_upload_timeout must be a number in [30, 600]")
-    for field_name in ("event_queue_clear_on_session_reset", "event_queue_clean_command_enabled"):
+    for field_name in (
+        "event_queue_clear_on_session_reset",
+        "event_queue_clean_command_enabled",
+        "active_window_enabled",
+        "poke_as_trigger",
+    ):
         if not isinstance(getattr(cfg, field_name), bool):
             errors.append(f"{field_name} must be bool")
 
@@ -722,12 +775,15 @@ def _validate_group(cfg: AdapterConfig, gid: str, gc: GroupConfig, errors: list[
         "keyword_first_only",
         "strip_first_mention",
         "reaction_emoji_enabled",
+        "reaction_emoji_mention_only",
         "command_filter_enabled",
         "command_filter_unknown",
         "message_show_group_id",
         "notify_poke_enabled",
         "notify_member_change_enabled",
         "outbound_filter_enabled",
+        "active_window_enabled",
+        "poke_as_trigger",
     )
     for field_name in nullable_bool_fields:
         value = getattr(gc, field_name)
@@ -749,6 +805,11 @@ def _validate_group(cfg: AdapterConfig, gid: str, gc: GroupConfig, errors: list[
         not isinstance(window, (int, float)) or isinstance(window, bool) or window < 0
     ):
         errors.append(f"group {gid} group_rate_limit_window_seconds must be non-negative or null")
+    active_seconds = gc.active_window_seconds
+    if active_seconds is not None and (
+        not isinstance(active_seconds, (int, float)) or isinstance(active_seconds, bool) or active_seconds <= 0
+    ):
+        errors.append(f"group {gid} active_window_seconds must be positive or null")
     resolved_messages = cfg.resolve_group_rate_limit_messages(gid)
     resolved_window = cfg.resolve_group_rate_limit_window_seconds(gid)
     if isinstance(resolved_messages, int) and not isinstance(resolved_messages, bool) \
@@ -833,6 +894,7 @@ def _inject_comments(d: dict[str, Any]) -> dict[str, Any]:
         "usage_stats_retention_days": "用量统计保留天数(默认365),过期记录自动清理",
         "groups": "群组配置,key为群号字符串,value为群配置对象;子字段require_mention等为null时跟随全局",
         "reaction_emoji_enabled": "消息送达 Hermes 后在原消息贴表情回应;群配置可单独覆盖",
+        "reaction_emoji_mention_only": "只对 @bot 的消息贴表情;窗口内被动消息不回应(默认开启)",
         "reaction_emoji_id": "贴表情回应使用的表情ID(默认 124),QQ 表情编号",
         "file_upload_timeout": "群/私聊/闪传文件上传等待 NapCat 响应的超时秒数(30-600,默认600);"
                                "群上传超时后仍会查询群历史保守确认结果",
@@ -860,6 +922,11 @@ def _inject_comments(d: dict[str, Any]) -> dict[str, Any]:
                                  " platforms.onebot.channel_prompts,需重启 Hermes 网关生效",
         "notify_poke_enabled": "戳一戳(bot 被戳)推送开关;开启后 bot 被戳会合成系统事件转发给 agent",
         "notify_member_change_enabled": "群成员进退群推送开关;开启后其他成员进群/退群会合成系统事件转发给 agent",
+        "active_window_enabled": "群活跃窗口总开关;开启后 @/关键词触发或成功出站会打开该群窗口,"
+                                 "窗口内非@群消息照常转发,窗外静默丢弃",
+        "active_window_seconds": "群活跃窗口时长(秒,默认300);@/关键词触发或成功出站后续期,"
+                                 "支持通过群配置单独覆盖",
+        "poke_as_trigger": "预留:戳 bot 直接唤醒 agent(当前默认关闭且尚未实现,戳一戳只作为上下文缓存)",
         "bot_blacklist_enabled": "允许 bot 使用独立动态黑名单工具并在消息触发时拦截命中用户",
         "bot_blacklist_max_duration_seconds": "bot 单次动态拉黑允许的最大秒数,默认86400(24小时)",
         "bot_blacklist_reject_message": "动态拉黑提示模板;支持 {user_id}/{scope}/{remaining}/{expires_at}/{reason}",

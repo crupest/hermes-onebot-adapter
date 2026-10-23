@@ -51,6 +51,7 @@ from onebot_adapter.relay.hermes_ws import HermesRelayServer
 from onebot_adapter.relay.protocol import FilteredEvent, parse_chat_id
 from onebot_adapter.usage_stats import UsageStatsStore
 from onebot_adapter.webui import routes as webui_routes
+from onebot_adapter.window import NoticeBuffer, WindowStore, bind_window_context
 
 logger = logging.getLogger(__name__)
 audit_logger = logging.getLogger("onebot_adapter.audit")
@@ -136,6 +137,8 @@ class AdapterService:
         self._usage_stats: UsageStatsStore | None = None
         self._bot_blacklist: BotBlacklistStore | None = None
         self._friend_cache: FriendCache | None = None
+        self._window_store: WindowStore | None = None
+        self._notice_buffer: NoticeBuffer | None = None
         self._rate_limiter = MessageRateLimiter()
         self._state["rate_limiter"] = self._rate_limiter
         self._config_change_lock = asyncio.Lock()
@@ -156,6 +159,13 @@ class AdapterService:
         self._api.configure_send_logging(config=cfg, name_resolver=self._name_resolver)
         self._friend_cache = FriendCache(self._api)
         self._seq_map = SeqMap(maxlen=cfg.seq_map_size)
+        # One WindowStore/NoticeBuffer per service: the parser pipeline and the
+        # relay must observe the same state.  bind_window_context exposes them
+        # to parse_event() without threading new parameters through the
+        # transport/handler constructors.
+        self._window_store = WindowStore(cfg.active_window_seconds)
+        self._notice_buffer = NoticeBuffer()
+        bind_window_context(cfg, self._window_store, self._notice_buffer)
         self._relay = HermesRelayServer(
             cfg,
             self._api,
@@ -167,6 +177,8 @@ class AdapterService:
             seq_map=self._seq_map,
             name_resolver=self._name_resolver,
             local_api_call=self._handle_local_api_call,
+            window_store=self._window_store,
+            notice_buffer=self._notice_buffer,
         )
         self._state["relay"] = self._relay
         self._onebot_reverse = OneBotReverseServer(
@@ -444,6 +456,14 @@ class AdapterService:
         group_id = str(num_id) if is_group else None
         if not cfg.resolve_reaction_emoji_enabled(group_id):
             return
+        if (
+            is_group
+            and cfg.resolve_reaction_emoji_mention_only(group_id)
+            and not getattr(event, "is_mention", False)
+        ):
+            # Only explicit @bot messages get the reaction; passive messages
+            # that merely fall inside the active window stay untouched.
+            return
         if not self._relay or not self._relay.has_clients:
             return
         try:
@@ -582,6 +602,12 @@ class AdapterService:
             await self._onebot_reverse.stop()
         if self._relay:
             await self._relay.stop()
+        if self._window_store is not None:
+            self._window_store.clear()
+            self._window_store = None
+        if self._notice_buffer is not None:
+            self._notice_buffer.clear()
+            self._notice_buffer = None
         if self._usage_stats:
             await self._usage_stats.close()
             self._usage_stats = None
@@ -630,6 +656,16 @@ class AdapterService:
         # holders reading config fields at request/connect time see the new
         # values (hermes_ws_token, onebot_ws_token for WS handshake,
         # group/DM settings used by the event parser, etc.).
+        # Rebind the window context first: dataclasses.replace() (used by
+        # ConfigStore.patch) drops the non-field store attributes, and the
+        # parser/handler must see the fresh config already carrying them.
+        if self._window_store is not None:
+            self._window_store.set_ttl(new.active_window_seconds)
+            if not new.active_window_enabled:
+                self._window_store.clear()
+                if self._notice_buffer is not None:
+                    self._notice_buffer.clear()
+            bind_window_context(new, self._window_store, self._notice_buffer)
         if self._relay:
             self._relay.update_config(new)
         if self._onebot_reverse:

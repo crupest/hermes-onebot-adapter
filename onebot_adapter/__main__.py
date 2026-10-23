@@ -73,7 +73,7 @@ def _init_config(force: bool) -> int:
 
     cfg = AdapterConfig(**existing_tokens)
     tokens_were_missing = not all(
-        existing_tokens[key] for key in ("onebot_ws_token", "hermes_ws_token", "webui_token")
+        existing_tokens.get(key) for key in ("onebot_ws_token", "hermes_ws_token", "webui_token")
     )
     reason = "cli.force_reinitialize" if target.exists() and force else "cli.init_config"
     cfg = ensure_tokens(
