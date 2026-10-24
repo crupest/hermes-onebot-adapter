@@ -86,6 +86,39 @@ async def test_group_mention_opens_window_and_marks_is_mention():
     assert store.active("42") is True
 
 
+async def test_bare_mention_without_body_reaches_hermes():
+    clock = FakeClock()
+    store = WindowStore(300.0, clock=clock)
+    cfg = _config()
+    result = await _parse(_group_event("", mention=True), cfg, store)
+    assert isinstance(result, NormalizedEvent)
+    assert result.is_mention is True
+    assert result.text == "[Alice(100)#1]: [@了你，没有正文]"
+    assert store.active("42") is True
+
+
+async def test_bare_mention_with_whitespace_body_reaches_hermes():
+    clock = FakeClock()
+    store = WindowStore(300.0, clock=clock)
+    cfg = _config()
+    segments = [
+        {"type": "at", "data": {"qq": "999"}},
+        {"type": "text", "data": {"text": "   "}},
+    ]
+    result = await _parse(_group_event(segments=segments), cfg, store)
+    assert isinstance(result, NormalizedEvent)
+    assert result.text == "[Alice(100)#1]: [@了你，没有正文]"
+
+
+async def test_empty_message_inside_window_is_still_dropped():
+    store = WindowStore(300.0, clock=FakeClock())
+    store.touch("42")
+    cfg = _config()
+    result = await _parse(_group_event(segments=[]), cfg, store)
+    assert isinstance(result, DroppedEvent)
+    assert result.reason == "empty"
+
+
 async def test_group_keyword_opens_window_without_mention():
     clock = FakeClock()
     store = WindowStore(300.0, clock=clock)

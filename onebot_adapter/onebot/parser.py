@@ -50,6 +50,12 @@ _SESSION_RESET_COMMANDS = frozenset({"new", "reset"})
 
 _AT_PATTERN = re.compile(r"@(\d{5,11})")
 
+# A message that consists only of the trigger @ (plus whitespace) renders to an
+# empty string once the mention is stripped. Substituting a visible placeholder
+# keeps it from being dropped as "empty", so Hermes can answer the bare ping
+# instead of the user seeing nothing at all.
+_BARE_MENTION_TEXT = "[@了你，没有正文]"
+
 
 def _format_sender_prefix(
     name: str, qq_id: str, seq: str = "",
@@ -944,6 +950,9 @@ async def _render_message(
             media_items=media_items,
         )
     text = _render_main_segments(state.raw_segments, counter, media_items, state.include_url, forward_text)
+    if not text and state.is_mention:
+        # Bare @bot with no body: survive the "empty" drop below.
+        text = _BARE_MENTION_TEXT
     if options.name_resolver:
         text = await _resolve_at_mentions(text, state.group_id, options.name_resolver)
     text = _decorate_group_text(text, event, state, options.config)

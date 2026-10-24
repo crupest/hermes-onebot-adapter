@@ -5,7 +5,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 from onebot_adapter.onebot import parser
-from onebot_adapter.relay.protocol import DroppedEvent, FilteredEvent
+from onebot_adapter.relay.protocol import DroppedEvent, FilteredEvent, NormalizedEvent
 
 
 def assert_dropped(result: object, reason: str) -> DroppedEvent:
@@ -106,6 +106,29 @@ async def test_parse_empty_message_filtered():
         group_require_mention=True,
     )
     assert_dropped(result, "empty")
+
+
+async def test_parse_bare_group_mention_reaches_hermes():
+    segs = [{"type": "at", "data": {"qq": "999"}}]
+    result = await parser.parse_event(
+        _msg_event("", message_type="group", group_id=42, segments=segs),
+        self_id="999",
+        group_require_mention=True,
+    )
+    assert isinstance(result, NormalizedEvent)
+    assert result.is_mention is True
+    assert result.text == "[Tester(100)#1]: [@了你，没有正文]"
+
+
+async def test_parse_bare_private_mention_keeps_raw_mention():
+    segs = [{"type": "at", "data": {"qq": "999"}}]
+    result = await parser.parse_event(
+        _msg_event("", message_type="private", user_id=100, segments=segs),
+        self_id="999",
+        group_require_mention=True,
+    )
+    assert isinstance(result, NormalizedEvent)
+    assert result.text == "@999"
 
 
 async def test_parse_group_slash_command_no_prefix():
