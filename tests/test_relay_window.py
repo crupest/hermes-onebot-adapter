@@ -192,6 +192,56 @@ async def test_api_call_filtered_send_does_not_renew_window():
     assert store.active("42") is False
 
 
+async def test_api_call_emoji_reaction_renews_window_via_chat_id():
+    relay, api, store, _, _, ws = _make_relay()
+    await relay._handle_api_call(
+        ws,
+        api_call_message(
+            "set_msg_emoji_like", "r1",
+            {"message_id": "77", "emoji_id": "128076"},
+            chat_id="group:42",
+        ),
+    )
+    api.call.assert_awaited_once()
+    assert store.active("42") is True
+
+
+async def test_api_call_emoji_reaction_without_chat_id_does_not_renew_window():
+    relay, _, store, _, _, ws = _make_relay()
+    await relay._handle_api_call(
+        ws,
+        api_call_message("set_msg_emoji_like", "r1", {"message_id": "77", "emoji_id": "128076"}),
+    )
+    assert len(store) == 0
+
+
+async def test_api_call_emoji_reaction_in_dm_does_not_open_group_window():
+    relay, _, store, _, _, ws = _make_relay()
+    await relay._handle_api_call(
+        ws,
+        api_call_message(
+            "set_msg_emoji_like", "r1",
+            {"message_id": "77", "emoji_id": "128076"},
+            chat_id="100",
+        ),
+    )
+    assert len(store) == 0
+
+
+async def test_failed_emoji_reaction_does_not_renew_window():
+    relay, api, store, _, _, ws = _make_relay()
+    api.call.side_effect = RuntimeError("boom")
+    await relay._handle_api_call(
+        ws,
+        api_call_message(
+            "set_msg_emoji_like", "r1",
+            {"message_id": "77", "emoji_id": "128076"},
+            chat_id="group:42",
+        ),
+    )
+    assert store.active("42") is False
+
+
 async def test_inbound_event_without_send_does_not_renew_window():
     relay, _, store, _, clock, _ = _make_relay()
     store.touch("42")

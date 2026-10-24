@@ -213,8 +213,13 @@ def send_message(action: SendAction, req_id: str, chat_id: str, **payload: Any) 
     return msg
 
 
-def api_call_message(action: str, req_id: str, params: dict[str, Any]) -> dict[str, Any]:
-    return envelope("api_call", action=action, req_id=req_id, params=params)
+def api_call_message(
+    action: str, req_id: str, params: dict[str, Any], chat_id: str = "",
+) -> dict[str, Any]:
+    msg = envelope("api_call", action=action, req_id=req_id, params=params)
+    if chat_id:
+        msg["chat_id"] = chat_id
+    return msg
 
 
 def result_message(

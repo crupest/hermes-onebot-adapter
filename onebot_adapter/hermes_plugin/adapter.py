@@ -63,6 +63,22 @@ _msg_context: contextvars.ContextVar[tuple[bool, str, str, bool] | None] = conte
 )
 
 
+def _current_chat_id() -> str:
+    """Chat id of the message being processed, or ``""`` outside a turn.
+
+    Tool calls run inside the per-message task that set ``_msg_context``, so
+    this gives the adapter enough context to renew the right group's active
+    window when the tool has no ``group_id`` parameter (emoji reactions).
+    """
+    ctx = _msg_context.get()
+    if not ctx:
+        return ""
+    _, group_id, user_id, _ = ctx
+    if group_id:
+        return f"group:{group_id}"
+    return str(user_id or "")
+
+
 def _set_future_result(fut: asyncio.Future[dict[str, Any]], data: dict[str, Any]) -> None:
     if not fut.done():
         fut.set_result(data)
@@ -1239,13 +1255,22 @@ class OneBotAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
     # ── Outbound send helpers ────────────────────────────────────────────
 
-    async def _rpc(self, frame_type: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _rpc(
+        self,
+        frame_type: str,
+        action: str,
+        payload: dict[str, Any],
+        *,
+        chat_id: str = "",
+    ) -> dict[str, Any]:
         """Send a ``send`` or ``api_call`` frame and await the matching ``result``.
 
         Shared implementation for ``_request`` (send actions) and ``_api_call``
         (OneBot API calls).  Concurrency is bounded by ``_send_semaphore`` so
         that Gateway retry storms cannot pile up unlimited parallel sends on
-        the serial OneBot WS.
+        the serial OneBot WS.  ``api_call`` frames carry the originating
+        ``chat_id`` so the adapter can renew that chat's active window for
+        tool calls that have no ``group_id`` parameter.
         """
         async with self._send_semaphore:
             if not self._ws or self._ws.closed:
@@ -1254,6 +1279,8 @@ class OneBotAdapter(BasePlatformAdapter):  # type: ignore[misc]
             msg: dict[str, Any] = {"type": frame_type, "action": action, "req_id": req_id}
             if frame_type == "api_call":
                 msg["params"] = payload
+                if chat_id:
+                    msg["chat_id"] = chat_id
             else:
                 msg.update(payload)
             fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
@@ -1474,7 +1501,7 @@ class OneBotAdapter(BasePlatformAdapter):  # type: ignore[misc]
     async def _api_call(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
         logger.debug("OneBot plugin api_call: action=%s", action)
         logger.debug("OneBot plugin api_call params: %s", _safe_log_json(params))
-        result = await self._rpc("api_call", action, params)
+        result = await self._rpc("api_call", action, params, chat_id=_current_chat_id())
         if result.get("success"):
             logger.debug(
                 "OneBot plugin api_call result: action=%s success=%s data=%s",

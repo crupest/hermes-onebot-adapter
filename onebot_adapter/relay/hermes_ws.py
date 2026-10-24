@@ -408,14 +408,23 @@ class HermesRelayServer:
         # while the session-reset turn is still finishing.
         self._window_quiet_until[group_id] = time.monotonic() + self._WINDOW_QUIET_SECONDS
 
-    def _touch_active_window_after_api_send(self, action: str, params: dict[str, Any]) -> None:
-        """Renew the window when a tool-driven ``send_*_msg`` call succeeded."""
-        if action not in API_SEND_ACTIONS:
+    def _touch_active_window_after_api_call(
+        self, action: str, params: dict[str, Any], chat_id: str = "",
+    ) -> None:
+        """Renew the window when a tool-driven call implies participation.
+
+        ``send_*_msg`` calls carry ``group_id`` directly.  ``set_msg_emoji_like``
+        has no group parameter, so it uses the plugin-supplied *chat_id*: an
+        emoji ack (👌) keeps the window open while a long task runs, without
+        letting reactions in a DM create a group window.
+        """
+        if action in API_SEND_ACTIONS:
+            raw_gid = params.get("group_id")
+            if raw_gid not in (None, ""):
+                self._touch_active_window(str(raw_gid))
             return
-        raw_gid = params.get("group_id")
-        if raw_gid in (None, ""):
-            return
-        self._touch_active_window(str(raw_gid))
+        if action == "set_msg_emoji_like" and chat_id:
+            self._touch_active_window(self._group_key_from_chat_id(chat_id))
 
     @staticmethod
     def _group_key_from_chat_id(chat_id: str) -> str:
@@ -1470,6 +1479,7 @@ class HermesRelayServer:
         req_id = data.get("req_id", str(uuid.uuid4()))
         action = data.get("action", "")
         params = data.get("params", {}) or {}
+        chat_id = str(data.get("chat_id") or "")
         logger.debug("relay api_call: action=%s req_id=%s", action, req_id)
         logger.debug("relay api_call params: %s", safe_json(params))
         if not api_action_allowed(action):
@@ -1512,7 +1522,7 @@ class HermesRelayServer:
                     "relay api_call result: action=%s ok=True data=%s",
                     action, safe_json(result.get("data")),
                 )
-                self._touch_active_window_after_api_send(action, params)
+                self._touch_active_window_after_api_call(action, params, chat_id)
                 await ws.send_json(result_message(req_id, True, data=result.get("data")))
             except ob.UploadOutcomeUnknownError as exc:
                 logger.warning("api_call %s outcome unknown: %s", action, exc)
